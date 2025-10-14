@@ -1,0 +1,191 @@
+Option Explicit
+
+' ==== CONFIG ====
+Const TARGET_SHEET_NAME As String = "EngagementLog"   ' change if needed
+Const HEADER_ROW As Long = 0                           ' 0 = first row (A1 row)
+Dim EXPECTED_HEADERS(2) As String
+' Expected header texts in the source export (case-insensitive, partial match allowed)
+' Adjust these if your export uses different labels
+Sub InitHeaders()
+    EXPECTED_HEADERS(0) = "Client"
+    EXPECTED_HEADERS(1) = "Binder ID"
+    EXPECTED_HEADERS(2) = "Pages"
+End Sub
+
+' ==== ENTRY POINT ====
+Sub ImportPendingBinders()
+    InitHeaders()
+
+    Dim sPath As String : sPath = PickFileXlsx()
+    If sPath = "" Then Exit Sub
+
+    Dim srcDoc As Object, targetDoc As Object, srcSheet As Object, tgtSheet As Object
+    targetDoc = ThisComponent
+    tgtSheet = GetOrCreateSheet(targetDoc, TARGET_SHEET_NAME)
+
+    ' Open source XLSX hidden (read-only)
+    Dim args(1) As New com.sun.star.beans.PropertyValue
+    args(0).Name = "Hidden" : args(0).Value = True
+    args(1).Name = "ReadOnly" : args(1).Value = True
+    srcDoc = StarDesktop.loadComponentFromURL(ConvertToURL(sPath), "_blank", 0, args())
+    If IsNull(srcDoc) Then
+        MsgBox "Could not open source file.", 16, "Import Pending Binders"
+        Exit Sub
+    End If
+
+    On Error GoTo CleanFail
+    srcSheet = srcDoc.Sheets(0) ' first sheet; change if needed
+
+    ' Map headers -> column indices in the source
+    Dim colIdx(2) As Long
+    Dim i As Long
+    For i = 0 To UBound(EXPECTED_HEADERS)
+        colIdx(i) = FindHeaderColumn(srcSheet, HEADER_ROW, EXPECTED_HEADERS(i))
+        If colIdx(i) = -1 Then
+            MsgBox "Header not found in source: " & EXPECTED_HEADERS(i), 48, "Import Pending Binders"
+            GoTo CleanFail
+        End If
+    Next i
+
+    ' Determine last used row in source (0-based)
+    Dim lastSrcRow As Long : lastSrcRow = LastUsedRow(srcSheet)
+    If lastSrcRow <= HEADER_ROW Then
+        MsgBox "No data rows found under the header.", 48, "Import Pending Binders"
+        GoTo CleanFail
+    End If
+
+    ' Build a 2D array [rows x 3] to paste
+    Dim rowsCount As Long : rowsCount = lastSrcRow - HEADER_ROW
+    Dim dataArr() As Variant : ReDim dataArr(rowsCount - 1, 2)
+
+    Dim r As Long, srcR As Long
+    For r = 0 To rowsCount - 1
+        srcR = HEADER_ROW + 1 + r
+        dataArr(r, 0) = Trim(CStr(srcSheet.getCellByPosition(colIdx(0), srcR).String)) ' Client
+        dataArr(r, 1) = Trim(CStr(srcSheet.getCellByPosition(colIdx(1), srcR).String)) ' Binder ID
+        dataArr(r, 2) = NormalizeInt(srcSheet.getCellByPosition(colIdx(2), srcR).String) ' Pages -> integer-ish
+    Next r
+
+    ' Paste into target at first empty row (append)
+    Dim firstEmpty As Long : firstEmpty = FirstEmptyRow(tgtSheet)
+    Dim tgtRange As Object
+    tgtRange = tgtSheet.getCellRangeByPosition(0, firstEmpty, 2, firstEmpty + rowsCount - 1) ' A..C
+    tgtRange.setDataArray(dataArr)
+
+    ' OPTIONAL: simple dedupe by Binder ID (column B = index 1)
+    'Call DedupeByColumn(tgtSheet, 1)
+
+    MsgBox "Imported " & rowsCount & " rows into " & TARGET_SHEET_NAME & " (starting at row " & (firstEmpty + 1) & ").", 64, "Import Pending Binders"
+
+CleanExit:
+    If Not IsNull(srcDoc) Then srcDoc.close(True)
+    Exit Sub
+
+CleanFail:
+    MsgBox "Import failed. " & Err & " - " & Error$, 16, "Import Pending Binders"
+    Resume CleanExit
+End Sub
+
+' ==== HELPERS ====
+
+Function PickFileXlsx() As String
+    Dim fp As Object
+    fp = CreateUnoService("com.sun.star.ui.dialogs.FilePicker")
+    Dim pickerType As Long : pickerType = com.sun.star.ui.dialogs.TemplateDescription.FILEOPEN_SIMPLE
+    fp.initialize(Array(pickerType))
+    fp.appendFilter("Excel files", "*.xlsx;*.xls")
+    fp.appendFilter("All files", "*.*")
+    fp.setCurrentFilter("Excel files")
+
+    If fp.execute() = com.sun.star.ui.dialogs.ExecutableDialogResults.OK Then
+        Dim files() As String : files = fp.getFiles()
+        If UBound(files) >= 0 Then
+            PickFileXlsx = ConvertFromURL(files(0))
+            Exit Function
+        End If
+    End If
+    PickFileXlsx = ""
+End Function
+
+Function GetOrCreateSheet(doc As Object, name As String) As Object
+    Dim sheets As Object : sheets = doc.getSheets()
+    If sheets.hasByName(name) Then
+        GetOrCreateSheet = sheets.getByName(name)
+    Else
+        sheets.insertNewByName(name, sheets.getCount())
+        GetOrCreateSheet = sheets.getByName(name)
+        ' Optional: add headers in row 1 (A1..C1)
+        GetOrCreateSheet.getCellByPosition(0, 0).String = "Client"
+        GetOrCreateSheet.getCellByPosition(1, 0).String = "Binder ID"
+        GetOrCreateSheet.getCellByPosition(2, 0).String = "Pages"
+    End If
+End Function
+
+Function LastUsedRow(sheet As Object) As Long
+    ' Find last used row via cursor
+    Dim cursor As Object
+    cursor = sheet.createCursor()
+    cursor.gotoEndOfUsedArea(True)
+    LastUsedRow = cursor.RangeAddress.EndRow
+End Function
+
+Function FirstEmptyRow(sheet As Object) As Long
+    Dim lastRow As Long : lastRow = LastUsedRow(sheet)
+    Dim r As Long
+    For r = 1 To lastRow   ' start after header row
+        If IsRowEmpty(sheet, r) Then
+            FirstEmptyRow = r
+            Exit Function
+        End If
+    Next r
+    FirstEmptyRow = lastRow + 1
+End Function
+
+Function IsRowEmpty(sheet As Object, r As Long) As Boolean
+    Dim a As String, b As String, c As String
+    a = Trim(sheet.getCellByPosition(0, r).String)
+    b = Trim(sheet.getCellByPosition(1, r).String)
+    c = Trim(sheet.getCellByPosition(2, r).String)
+    IsRowEmpty = (a = "" And b = "" And c = "")
+End Function
+
+Function FindHeaderColumn(sheet As Object, headerRow As Long, wanted As String) As Long
+    Dim cursor As Object, lastCol As Long, c As Long, txt As String
+    cursor = sheet.createCursor()
+    cursor.gotoEndOfUsedArea(True)
+    lastCol = cursor.RangeAddress.EndColumn
+    FindHeaderColumn = -1
+    Dim wantedL As String : wantedL = LCase(Trim(wanted))
+    For c = 0 To lastCol
+        txt = LCase(Replace(Trim(sheet.getCellByPosition(c, headerRow).String), Chr(160), " ")) ' normalize nbsp
+        If txt = wantedL Or InStr(txt, wantedL) > 0 Then
+            FindHeaderColumn = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+Function NormalizeInt(s As String) As Long
+    Dim i As Long
+    On Error Resume Next
+    i = CLng(Val(s))
+    On Error GoTo 0
+    NormalizeInt = i
+End Function
+
+Sub DedupeByColumn(sheet As Object, colIdx As Long)
+    ' naive O(n^2) dedupe: scans from bottom, deletes earlier duplicates
+    Dim lastRow As Long : lastRow = LastUsedRow(sheet)
+    Dim r As Long, k As Long
+    For r = lastRow To 1 Step -1
+        Dim key As String : key = LCase(Trim(sheet.getCellByPosition(colIdx, r).String))
+        If key <> "" Then
+            For k = r - 1 To 1 Step -1
+                If LCase(Trim(sheet.getCellByPosition(colIdx, k).String)) = key Then
+                    sheet.Rows.removeByIndex r, 1
+                    Exit For
+                End If
+            Next k
+        End If
+    Next r
+End Sub
